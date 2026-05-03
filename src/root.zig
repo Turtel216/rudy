@@ -4,6 +4,12 @@ const std = @import("std");
 /// Core SSA Intermediate Representation and builder API.
 pub const ir = @import("ir.zig");
 
+/// Generic backend framework (MachineFunction, TargetMachine vtable, etc.).
+pub const backend = @import("backend.zig");
+
+/// x86_64 target definitions and backend implementation.
+pub const x86_64 = @import("x86_64.zig");
+
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you
     // are implementing gzip, then only the compressed bytes should be sent to
