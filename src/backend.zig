@@ -25,6 +25,12 @@ pub fn MachineBasicBlock(comptime Instr: type) type {
         successors: std.ArrayList(u32) = .empty,
 
         pub fn deinit(self: *Self, alloc: Allocator) void {
+            // Free each instruction's arena-allocated operand slice.
+            for (self.insts.items) |mi| {
+                if (@hasField(Instr, "operands")) {
+                    alloc.free(mi.operands);
+                }
+            }
             self.insts.deinit(alloc);
             self.successors.deinit(alloc);
         }
