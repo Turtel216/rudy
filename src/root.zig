@@ -10,6 +10,9 @@ pub const backend = @import("backend.zig");
 /// x86_64 target definitions and backend implementation.
 pub const x86_64 = @import("x86_64.zig");
 
+/// Phi elimination pass.
+pub const phi_elimination = @import("phi_elimination.zig");
+
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you
     // are implementing gzip, then only the compressed bytes should be sent to

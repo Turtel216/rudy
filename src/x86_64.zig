@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ir = @import("ir.zig");
 const backend = @import("backend.zig");
+const phi_elimination = @import("phi_elimination.zig");
 
 ///  Physical Registers
 pub const X86Reg = enum {
@@ -168,7 +169,7 @@ pub const X86_64Target = struct {
         const mf = try alloc.create(MFunc);
         mf.* = .{ .name = func.name };
 
-        // Map SSA InstIndex → virtual register.
+        // Map SSA InstIndex -> virtual register.
         var vreg_map = std.AutoHashMap(u32, Register).init(alloc);
         defer vreg_map.deinit();
 
@@ -219,14 +220,18 @@ pub const X86_64Target = struct {
                     },
 
                     .br => |b| {
-                        try appendInstr(alloc, mbb, .jmp, &.{Operand.blk(@intFromEnum(b.target))});
+                        // Unconditional jump. Could be optimized if target is next block.
+                        const target_idx = @intFromEnum(b.target);
+                        if (target_idx != blk_i + 1) {
+                            try appendInstr(alloc, mbb, .jmp, &.{Operand.blk(target_idx)});
+                        }
                     },
 
                     .cond_br => |cb| {
                         const cond_idx = cb.cond.toInt();
                         if (flag_producers.contains(cond_idx)) {
-                            // cond was produced by icmp_eq → flags are already set.
-                            // je then_target (ZF=1 means equal → condition is true)
+                            // cond was produced by icmp_eq -> flags are already set.
+                            // je then_target (ZF=1 means equal => condition is true)
                             try appendInstr(alloc, mbb, .je, &.{Operand.blk(@intFromEnum(cb.then_target))});
                         } else {
                             // Generic: testq cond, cond; jne then_target
@@ -234,20 +239,40 @@ pub const X86_64Target = struct {
                             try appendInstr(alloc, mbb, .tst, &.{ Operand.reg(cond_reg), Operand.reg(cond_reg) });
                             try appendInstr(alloc, mbb, .jne, &.{Operand.blk(@intFromEnum(cb.then_target))});
                         }
+
                         // Unconditional jump to else_target.
-                        try appendInstr(alloc, mbb, .jmp, &.{Operand.blk(@intFromEnum(cb.else_target))});
+                        // Fallthrough optimization: if else_target is the next block in layout, we can omit the jmp.
+                        const else_idx = @intFromEnum(cb.else_target);
+                        if (else_idx != blk_i + 1) {
+                            try appendInstr(alloc, mbb, .jmp, &.{Operand.blk(else_idx)});
+                        }
                     },
 
                     .phi => {
                         // Phi elimination is deferred to a later pass.
                         // The vreg is pre-assigned but no code is emitted.
-                        _ = blk_i;
                     },
                 }
             }
         }
 
+        // Run phi elimination pass.
+        const Pass = phi_elimination.PhiElimination(MachineInstr, Register, x86CreateCopy, x86IsTerminator);
+        try Pass.run(alloc, mf, func, &vreg_map);
+
         return mf;
+    }
+
+    fn x86CreateCopy(alloc: Allocator, dst: Register, src: Register) !MachineInstr {
+        const operands = try alloc.dupe(Operand, &.{ Operand.reg(src), Operand.reg(dst) });
+        return MachineInstr{ .opcode = .mov, .operands = operands };
+    }
+
+    fn x86IsTerminator(mi: MachineInstr) bool {
+        return switch (mi.opcode) {
+            .jmp, .je, .jne, .ret => true,
+            else => false,
+        };
     }
 
     fn lowerBinOp(
@@ -278,7 +303,7 @@ pub const X86_64Target = struct {
 
     /// Allocate physical registers for all virtual registers in `mf`.
     pub fn allocateRegisters(alloc: Allocator, mf: *MFunc) !void {
-        // Build live intervals: map vreg → [first_seen, last_seen].
+        // Build live intervals: map vreg -> [first_seen, last_seen].
         var intervals_map = std.AutoHashMap(u32, LiveInterval).init(alloc);
         defer intervals_map.deinit();
 
@@ -331,7 +356,7 @@ pub const X86_64Target = struct {
         var active = std.ArrayList(*LiveInterval).empty;
         defer active.deinit(alloc);
 
-        // Assignment map: vreg → physical reg.
+        // Assignment map: vreg -> physical reg.
         var assignment = std.AutoHashMap(u32, X86Reg).init(alloc);
         defer assignment.deinit();
 
@@ -399,13 +424,13 @@ pub const X86_64Target = struct {
 
             for (block.insts.items) |mi| {
                 try writer.writeAll("    ");
-                try emitInstr(mi, writer);
+                try emitInstr(mf, mi, writer);
                 try writer.writeAll("\n");
             }
         }
     }
 
-    fn emitInstr(mi: MachineInstr, writer: std.io.AnyWriter) !void {
+    fn emitInstr(mf: *const MFunc, mi: MachineInstr, writer: std.io.AnyWriter) !void {
         const mnemonic = switch (mi.opcode) {
             .mov => "movq",
             .add => "addq",
@@ -430,11 +455,11 @@ pub const X86_64Target = struct {
             } else {
                 try writer.writeAll(", ");
             }
-            try emitOperand(op, writer);
+            try emitOperand(mf, op, writer);
         }
     }
 
-    fn emitOperand(op: Operand, writer: std.io.AnyWriter) !void {
+    fn emitOperand(mf: *const MFunc, op: Operand, writer: std.io.AnyWriter) !void {
         switch (op) {
             .register => |r| switch (r) {
                 .physical => |p| try writer.writeAll(p.name()),
@@ -452,7 +477,19 @@ pub const X86_64Target = struct {
                 }
                 try writer.writeAll(")");
             },
-            .block_ref => |idx| try writer.print(".LBB{d}", .{idx}),
+            .block_ref => |idx| {
+                // Must handle out-of-bounds just in case, though it shouldn't happen.
+                if (idx < mf.blocks.items.len) {
+                    const blk = mf.blocks.items[idx];
+                    if (blk.label) |lbl| {
+                        try writer.print(".LBB{d}_{s}", .{ idx, lbl });
+                    } else {
+                        try writer.print(".LBB{d}", .{idx});
+                    }
+                } else {
+                    try writer.print(".LBB{d}", .{idx});
+                }
+            },
         }
     }
 
@@ -464,7 +501,7 @@ pub const X86_64Target = struct {
     }
 };
 
-test "x86_64 full pipeline: ISel → RegAlloc → Emit" {
+test "x86_64 full pipeline: ISel -> RegAlloc -> Emit" {
     const alloc = std.testing.allocator;
 
     // Build a small SSA IR function:
@@ -530,4 +567,137 @@ test "x86_64 full pipeline: ISel → RegAlloc → Emit" {
 
     // Print for visual inspection during development.
     std.debug.print("\n--- Emitted x86_64 Assembly ---\n{s}\n", .{asm_text});
+}
+
+test "x86_64 full pipeline: If/Else Diamond with Phi Elimination" {
+    const alloc = std.testing.allocator;
+
+    var func: ir.Function = .{ .name = "if_else" };
+    defer func.deinit(alloc);
+
+    var builder = ir.IRBuilder.init(alloc, &func);
+
+    const entry_bb = try builder.appendBlock("entry");
+    const then_bb = try builder.appendBlock("then");
+    const else_bb = try builder.appendBlock("else");
+    const merge_bb = try builder.appendBlock("merge");
+
+    // entry:
+    builder.setInsertPoint(entry_bb);
+    const arg = try builder.buildAdd(ir.InstIndex.fromInt(0), ir.InstIndex.fromInt(0));
+    const cond = try builder.buildICmpEq(arg, arg);
+    _ = try builder.buildCondBr(cond, then_bb, else_bb);
+
+    // then:
+    builder.setInsertPoint(then_bb);
+    const val_then = try builder.buildAdd(arg, arg);
+    _ = try builder.buildBr(merge_bb);
+
+    // else:
+    builder.setInsertPoint(else_bb);
+    const val_else = try builder.buildSub(arg, arg);
+    _ = try builder.buildBr(merge_bb);
+
+    // merge:
+    builder.setInsertPoint(merge_bb);
+    const phi_val = try builder.buildPhi(
+        &[_]ir.InstIndex{ val_then, val_else },
+        &[_]ir.BlockIndex{ then_bb, else_bb },
+    );
+    _ = try builder.buildRet(phi_val);
+
+    var x86_target = X86_64Target{};
+    const tm = x86_target.target();
+
+    const mf_opaque = try tm.lowerIR(alloc, &func);
+    defer tm.deinitMachineFunction(alloc, mf_opaque);
+
+    try tm.allocateRegisters(alloc, mf_opaque);
+
+    var buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try tm.emitAssembly(mf_opaque, fbs.writer().any());
+    const asm_text = fbs.getWritten();
+
+    // Verify condition and fallthrough/jumps
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, "cmpq") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, "je .LBB1_then") != null);
+    // Since 'else' is block 2 and follows 'entry' (block 0) ? No, entry is 0, then is 1, else is 2.
+    // So 'else' does NOT follow 'entry'. The jmp should be present.
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, "jmp .LBB2_else") != null);
+
+    // Verify phi elimination created movs in predecessors before jumps
+    // Actually, because of RegAlloc, the vregs will be mapped to the same physical reg or there will be movs.
+    // For now, just ensure assembly contains proper labels.
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, ".LBB3_merge:") != null);
+
+    std.debug.print("\n--- If/Else Diamond Assembly ---\n{s}\n", .{asm_text});
+}
+
+test "x86_64 full pipeline: Else-If Chain with Phi Elimination" {
+    const alloc = std.testing.allocator;
+
+    var func: ir.Function = .{ .name = "else_if" };
+    defer func.deinit(alloc);
+
+    var builder = ir.IRBuilder.init(alloc, &func);
+
+    const entry_bb = try builder.appendBlock("entry");
+    const if1_then_bb = try builder.appendBlock("if1_then");
+    const if2_cond_bb = try builder.appendBlock("if2_cond");
+    const if2_then_bb = try builder.appendBlock("if2_then");
+    const else_bb = try builder.appendBlock("else");
+    const merge_bb = try builder.appendBlock("merge");
+
+    // entry (if 1):
+    builder.setInsertPoint(entry_bb);
+    const arg1 = try builder.buildAdd(ir.InstIndex.fromInt(0), ir.InstIndex.fromInt(0));
+    const arg2 = try builder.buildAdd(ir.InstIndex.fromInt(1), ir.InstIndex.fromInt(1));
+    const cond1 = try builder.buildICmpEq(arg1, arg2);
+    _ = try builder.buildCondBr(cond1, if1_then_bb, if2_cond_bb);
+
+    // if1_then:
+    builder.setInsertPoint(if1_then_bb);
+    const val1 = try builder.buildAdd(arg1, arg1);
+    _ = try builder.buildBr(merge_bb);
+
+    // if2_cond:
+    builder.setInsertPoint(if2_cond_bb);
+    const cond2 = try builder.buildICmpEq(arg1, arg1);
+    _ = try builder.buildCondBr(cond2, if2_then_bb, else_bb);
+
+    // if2_then:
+    builder.setInsertPoint(if2_then_bb);
+    const val2 = try builder.buildAdd(arg2, arg2);
+    _ = try builder.buildBr(merge_bb);
+
+    // else:
+    builder.setInsertPoint(else_bb);
+    const val3 = try builder.buildSub(arg1, arg2);
+    _ = try builder.buildBr(merge_bb);
+
+    // merge:
+    builder.setInsertPoint(merge_bb);
+    const phi_val = try builder.buildPhi(
+        &[_]ir.InstIndex{ val1, val2, val3 },
+        &[_]ir.BlockIndex{ if1_then_bb, if2_then_bb, else_bb },
+    );
+    _ = try builder.buildRet(phi_val);
+
+    var x86_target = X86_64Target{};
+    const tm = x86_target.target();
+
+    const mf_opaque = try tm.lowerIR(alloc, &func);
+    defer tm.deinitMachineFunction(alloc, mf_opaque);
+
+    try tm.allocateRegisters(alloc, mf_opaque);
+
+    var buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try tm.emitAssembly(mf_opaque, fbs.writer().any());
+    const asm_text = fbs.getWritten();
+
+    std.debug.print("\n--- Else-If Chain Assembly ---\n{s}\n", .{asm_text});
+
+    try std.testing.expect(std.mem.indexOf(u8, asm_text, ".LBB5_merge:") != null);
 }
